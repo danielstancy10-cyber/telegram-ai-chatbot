@@ -1,0 +1,23 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment variables
+.env
+
+# Database
+customer_support.db
+
+# Generated files
+generated_image.png
+voice.wav
+voice.ogg
+
+# Tests
+test.py/
+
+# VS Code
+.vscode/
