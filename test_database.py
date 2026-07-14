@@ -1,10 +1,9 @@
-from database.postgres import engine
+from database.models import create_tables
 
 try:
-    connection = engine.connect()
-    print("✅ Connected to PostgreSQL!")
-    connection.close()
+    create_tables()
+    print("✅ Database ready! Users table created.")
 
 except Exception as e:
-    print("❌ Connection failed!")
+    print("❌ Error creating tables:")
     print(e)

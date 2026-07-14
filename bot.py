@@ -24,6 +24,7 @@ from translator import translate
 from database import save_lead
 from voice import speech_to_text
 from image_ai import generate_image
+from database.repository import create_user
 
 # =========================================================================
 # CONFIGURATION & LOGGING SUBSYSTEM
@@ -167,11 +168,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handles system orientation initialization clearing transient user runtime data safely."""
     if not update.message:
         return
-    
-    user_id = update.effective_user.id if update.effective_user else 0
+
+    user = update.effective_user
+    user_id = user.id if user else 0
+
     logger.info(f"User identity session initiated via start hook command context: {user_id}")
-    
-    # Sanitize operational data variables cleanly 
+
+    if user:
+        try:
+            print(f"Saving user: {user.id} | {user.username}")
+
+            create_user(
+                telegram_id=user.id,
+                username=user.username,
+                full_name=user.full_name,
+            )
+
+            print("✅ User saved successfully!")
+
+        except Exception as e:
+            print("❌ DATABASE ERROR:", e)
+            logger.exception("Failed to save user")
+
+    # Sanitize operational data variables cleanly
     context.user_data.clear()
     context.user_data["state"] = BotState.IDLE
     context.user_data["language"] = Language.ENGLISH.value
@@ -183,7 +202,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         reply_markup=MAIN_KEYBOARD,
         parse_mode="Markdown"
     )
-
 
 async def handle_incoming_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Processes pipeline translation for incoming audio payloads seamlessly."""
