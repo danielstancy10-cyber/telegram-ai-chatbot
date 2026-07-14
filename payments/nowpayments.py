@@ -1,0 +1,4 @@
+"""
+nowpayments.py
+Automatically created.
+"""

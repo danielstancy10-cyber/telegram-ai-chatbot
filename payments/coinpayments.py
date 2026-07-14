@@ -1,0 +1,4 @@
+"""
+coinpayments.py
+Automatically created.
+"""
