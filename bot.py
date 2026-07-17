@@ -6,8 +6,8 @@ from typing import Final, NoReturn
 from enum import StrEnum
 from pathlib import Path
 from dotenv import load_dotenv
-
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from database.migrations import run_migrations
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-# Core business logic infrastructure imports
+# ── Third-party business logic imports ────────────────────────────────────────
 from ai import ask_ai
 from translator import translate
 from database import save_lead
@@ -26,409 +26,536 @@ from voice import speech_to_text
 from image_ai import generate_image
 from database.repository import create_user
 
-# =========================================================================
-# CONFIGURATION & LOGGING SUBSYSTEM
-# =========================================================================
+# ── Handler imports ────────────────────────────────────────────────────────────
+from handlers.profile import profile
+from handlers.membership import membership
+from handlers.settings import settings
+from handlers.notifications import notifications
+
+# =============================================================================
+# CONFIGURATION & LOGGING
+# =============================================================================
 
 load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger("AIHelperBot")
 
 BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
-    logger.critical("CRITICAL: BOT_TOKEN environment variable is missing. Termination imminent.")
+    logger.critical("BOT_TOKEN environment variable is missing.")
     raise ValueError("BOT_TOKEN environment variable must be specified.")
 
-MAX_TELEGRAM_MESSAGE_LENGTH: Final[int] = 100
+MAX_TELEGRAM_MESSAGE_LENGTH: Final[int] = 4096
 EMAIL_REGEX: Final[re.Pattern[str]] = re.compile(
     r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
 )
 
-# =========================================================================
-# SYSTEM ENUMS & CONFIGURATION CONSTANTS
-# =========================================================================
+# =============================================================================
+# ENUMS & CONSTANTS
+# =============================================================================
+
 
 class BotState(StrEnum):
-    """Enumeration representing conversation flow states for structured tracking."""
-    IDLE = "IDLE"
-    WAITING_NAME = "WAITING_NAME"
-    WAITING_EMAIL = "WAITING_EMAIL"
+    """Conversation flow states."""
+    IDLE                = "IDLE"
+    WAITING_NAME        = "WAITING_NAME"
+    WAITING_EMAIL       = "WAITING_EMAIL"
     WAITING_IMAGE_PROMPT = "WAITING_IMAGE_PROMPT"
 
 
 class Language(StrEnum):
-    """Supported systemic localizations for user matching matrix."""
+    """Supported localizations."""
     ENGLISH = "English"
-    FRENCH = "French"
+    FRENCH  = "French"
     SPANISH = "Spanish"
-    ARABIC = "Arabic"
-    YORUBA = "Yoruba"
-    HAUSA = "Hausa"
-    IGBO = "Igbo"
+    ARABIC  = "Arabic"
+    YORUBA  = "Yoruba"
+    HAUSA   = "Hausa"
+    IGBO    = "Igbo"
 
 
 LANGUAGES_LIST: Final[list[str]] = [lang.value for lang in Language]
 
-# =========================================================================
-# UI KEYBOARD DESIGN PATTERNS
-# =========================================================================
+# =============================================================================
+# KEYBOARDS
+# =============================================================================
 
 MAIN_KEYBOARD: Final[ReplyKeyboardMarkup] = ReplyKeyboardMarkup(
     [
-        ["🤖 Ask AI", "🌍 Language"],
-        ["🛍 Products", "❓ FAQs"],
-        ["📞 Contact", "🎨 Generate Image"],
-        ["🎤 Voice Chat"]
+        ["🤖 Ask AI",       "🌍 Language"],
+        ["🛍 Products",     "❓ FAQs"],
+        ["📞 Contact",      "🎨 Generate Image"],
+        ["🎤 Voice Chat"],
     ],
     resize_keyboard=True,
-    is_persistent=True
+    is_persistent=True,
 )
 
 LANGUAGE_KEYBOARD: Final[ReplyKeyboardMarkup] = ReplyKeyboardMarkup(
     [
         ["English", "French"],
         ["Spanish", "Arabic"],
-        ["Yoruba", "Hausa"],
-        ["Igbo"]
+        ["Yoruba",  "Hausa"],
+        ["Igbo"],
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
 )
 
-# =========================================================================
-# UTILITY HELPER UTILITIES
-# =========================================================================
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
 
 def validate_email(email: str) -> bool:
-    """Verifies syntactic integrity of client provided emails via safe checking regex."""
+    """Return True if *email* passes the RFC-ish regex check."""
     return bool(EMAIL_REGEX.match(email))
 
 
-def split_message_text(text: str, max_size: int = MAX_TELEGRAM_MESSAGE_LENGTH) -> list[str]:
-    """Splits oversized responses safely without breaking words across transmission windows."""
+def split_message_text(
+    text: str,
+    max_size: int = MAX_TELEGRAM_MESSAGE_LENGTH,
+) -> list[str]:
+    """
+    Split *text* into chunks that fit within Telegram's message size limit
+    without breaking words.
+    """
     if len(text) <= max_size:
         return [text]
-    
+
     chunks: list[str] = []
     while text:
         if len(text) <= max_size:
             chunks.append(text)
             break
-        
+
         split_index = text.rfind("\n", 0, max_size)
         if split_index == -1:
             split_index = text.rfind(" ", 0, max_size)
         if split_index == -1:
             split_index = max_size
-            
+
         chunks.append(text[:split_index].strip())
         text = text[split_index:].strip()
+
     return chunks
 
 
 async def safe_file_cleanup(file_path: str | Path) -> None:
-    """Handles deletion of temporary media artifacts cleanly preventing I/O leaks."""
+    """Delete a temporary file without raising on failure."""
     try:
         path = Path(file_path)
         if path.exists():
             await asyncio.to_thread(path.unlink, missing_ok=True)
-            logger.info(f"Successfully cleaned up temporary system file: {file_path}")
-    except Exception as cleanup_err:
-        logger.error(f"Non-fatal error unlinking transient asset tracking '{file_path}': {cleanup_err}", exc_info=True)
+            logger.info("Cleaned up temporary file: %s", file_path)
+    except Exception as err:
+        logger.error("Could not delete '%s': %s", file_path, err, exc_info=True)
 
 
-async def execute_ai_pipeline_with_retry(prompt: str, target_lang: str, retries: int = 2) -> str:
-    """Invokes threaded processing cores applying fault recovery fallbacks gracefully."""
-    attempt = 0
-    while attempt <= retries:
+async def execute_ai_pipeline_with_retry(
+    prompt: str,
+    target_lang: str,
+    retries: int = 2,
+) -> str:
+    """
+    Call the AI backend, translate the result, and retry up to *retries* times
+    on transient failures.
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, retries + 2):
         try:
-            raw_ai_output = await asyncio.to_thread(ask_ai, prompt)
-            if not raw_ai_output or not raw_ai_output.strip():
-                raise ValueError("Downstream AI engine processed an empty textual output string.")
-                
-            translated_output = await asyncio.to_thread(translate, raw_ai_output, target_lang)
-            return translated_output
-        except Exception as error:
-            attempt += 1
-            logger.warning(f"AI Pipeline execution hiccup (Attempt {attempt}/{retries + 1}): {error}")
-            if attempt > retries:
-                logger.error("All fallback retry limits breached across threaded inference infrastructure pipeline.")
-                raise error
-            await asyncio.sleep(1.0 * attempt)
-    return "❌ Service temporary unavailable."
+            raw_output = await asyncio.to_thread(ask_ai, prompt)
+            if not raw_output or not raw_output.strip():
+                raise ValueError("AI engine returned an empty response.")
 
-# =========================================================================
-# MAIN ROUTING ENGINE INTERACTIVE SYSTEM HANDLERS
-# =========================================================================
+            translated = await asyncio.to_thread(translate, raw_output, target_lang)
+            return translated
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles system orientation initialization clearing transient user runtime data safely."""
+        except Exception as err:
+            last_error = err
+            logger.warning(
+                "AI pipeline attempt %d/%d failed: %s",
+                attempt,
+                retries + 1,
+                err,
+            )
+            if attempt <= retries:
+                await asyncio.sleep(1.0 * attempt)
+
+    logger.error("All AI pipeline retries exhausted.")
+    raise last_error  # type: ignore[misc]
+
+# =============================================================================
+# COMMAND HANDLERS
+# =============================================================================
+
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Register the user and display the main menu."""
     if not update.message:
         return
 
-    user = update.effective_user
-    user_id = user.id if user else 0
+    tg_user = update.effective_user
+    user_id = tg_user.id if tg_user else 0
+    logger.info("User %s triggered /start", user_id)
 
-    logger.info(f"User identity session initiated via start hook command context: {user_id}")
-
-    if user:
+    if tg_user:
         try:
-            print(f"Saving user: {user.id} | {user.username}")
-
-            create_user(
-                telegram_id=user.id,
-                username=user.username,
-                full_name=user.full_name,
+            # create_user may be sync or async — handle both.
+            result = create_user(
+                telegram_id=tg_user.id,
+                username=tg_user.username,
+                full_name=tg_user.full_name,
             )
+            # Await if the implementation is a coroutine.
+            if asyncio.iscoroutine(result):
+                await result
+            logger.info("User %s saved to database.", tg_user.id)
+        except Exception as err:
+            logger.exception("Failed to save user %s: %s", user_id, err)
 
-            print("✅ User saved successfully!")
-
-        except Exception as e:
-            print("❌ DATABASE ERROR:", e)
-            logger.exception("Failed to save user")
-
-    # Sanitize operational data variables cleanly
     context.user_data.clear()
-    context.user_data["state"] = BotState.IDLE
+    context.user_data["state"]    = BotState.IDLE
     context.user_data["language"] = Language.ENGLISH.value
 
     await update.message.reply_text(
-        "👋 **Welcome to AIHelperBot Enterprise Customer Care!**\n\n"
-        "I am your automated smart support representative optimized with advanced linguistic interpretation capabilities.\n\n"
-        "Select an option from the menu panel below to interface with the core subsystem components.",
+        "👋 *Welcome to AIHelperBot!*\n\n"
+        "I am your smart support assistant.\n\n"
+        "Select an option from the menu below to get started.",
         reply_markup=MAIN_KEYBOARD,
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
-async def handle_incoming_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processes pipeline translation for incoming audio payloads seamlessly."""
+# =============================================================================
+# MESSAGE HANDLERS
+# =============================================================================
+
+
+async def handle_incoming_voice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Transcribe a voice message and respond via the AI pipeline."""
     if not update.message or not update.message.voice:
         return
 
-    user_id = update.effective_user.id if update.effective_user else 0
+    tg_user    = update.effective_user
+    user_id    = tg_user.id if tg_user else 0
     message_id = update.message.message_id
-    voice_file_path = f"transient_audio_{user_id}_{message_id}.ogg"
-    
-    logger.info(f"Intercepted active voice transcription job for processing instance: {user_id}")
-    
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    status_indicator = await update.message.reply_text("🎤 Processing incoming audio track, please wait...")
+    voice_path = f"transient_audio_{user_id}_{message_id}.ogg"
+
+    logger.info("Voice message received from user %s", user_id)
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,  # type: ignore[union-attr]
+        action=ChatAction.TYPING,
+    )
+    status_msg = await update.message.reply_text(
+        "🎤 Processing your voice message, please wait…"
+    )
 
     try:
-        # File fetching segment via asynchronous download mechanism
-        voice_metadata = await context.bot.get_file(update.message.voice.file_id)
-        await voice_metadata.download_to_drive(voice_file_path)
+        voice_file = await context.bot.get_file(update.message.voice.file_id)
+        await voice_file.download_to_drive(voice_path)
 
-        # Offload computationally heavy file translation metrics out of critical loop path
-        transcribed_text = await asyncio.to_thread(speech_to_text, voice_file_path)
-        
-        if not transcribed_text or not transcribed_text.strip():
-            await status_indicator.edit_text("❌ Analysis failed: Audio structural transcription evaluated blank.")
+        transcribed = await asyncio.to_thread(speech_to_text, voice_path)
+
+        if not transcribed or not transcribed.strip():
+            await status_msg.edit_text(
+                "❌ Could not transcribe your audio. Please try again."
+            )
             return
 
-        await status_indicator.edit_text(f"🗣 **You said:**\n\n_\"{transcribed_text.strip()}\"_", parse_mode="Markdown")
-        
-        # Dispatch analytical loading indicator segment 
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        processing_indicator = await update.message.reply_text("🤖 Synthesizing response parameters...")
+        await status_msg.edit_text(
+            f"🗣 *You said:*\n\n_{transcribed.strip()}_",
+            parse_mode="Markdown",
+        )
 
-        user_selected_lang = context.user_data.get("language", Language.ENGLISH.value)
-        final_localized_reply = await execute_ai_pipeline_with_retry(transcribed_text, user_selected_lang)
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,  # type: ignore[union-attr]
+            action=ChatAction.TYPING,
+        )
+        thinking_msg = await update.message.reply_text("🤖 Thinking…")
 
-        # Handle massive buffer overflows natively via messaging chunk segment array loops
-        message_segments = split_message_text(final_localized_reply)
-        await processing_indicator.delete()
-        
-        for piece in message_segments:
-            await update.message.reply_text(piece)
+        lang   = context.user_data.get("language", Language.ENGLISH.value)
+        reply  = await execute_ai_pipeline_with_retry(transcribed, lang)
+        chunks = split_message_text(reply)
 
-    except Exception as runtime_error:
-        logger.error(f"Critical execution error caught during localized voice routing workflow: {runtime_error}", exc_info=True)
-        await update.message.reply_text("❌ Critical error: Unable to map audio context pipeline requirements safely.")
+        await thinking_msg.delete()
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+
+    except Exception as err:
+        logger.error("Voice handler error for user %s: %s", user_id, err, exc_info=True)
+        await update.message.reply_text(
+            "❌ An error occurred while processing your voice message."
+        )
     finally:
-        await safe_file_cleanup(voice_file_path)
+        await safe_file_cleanup(voice_path)
 
 
-async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Core text input router managing conversion states and structural functional routing paths."""
+async def handle_incoming_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Route text messages based on current conversation state and button presses."""
     if not update.message or not update.message.text:
         return
 
-    user_id = update.effective_user.id if update.effective_user else 0
-    raw_input = update.message.text.strip()
+    tg_user       = update.effective_user
+    user_id       = tg_user.id if tg_user else 0
+    raw_input     = update.message.text.strip()
     current_state = context.user_data.get("state", BotState.IDLE)
-    user_selected_lang = context.user_data.get("language", Language.ENGLISH.value)
+    lang          = context.user_data.get("language", Language.ENGLISH.value)
 
-    logger.info(f"Incoming message event context evaluated for [User ID: {user_id} | State: {current_state}]")
+    logger.info("Text from user %s | state=%s", user_id, current_state)
 
-    # =========================================================================
-    # STATE FLOW LOGIC MAPS (CONVERSATIONAL CONTEXT RECOVERY)
-    # =========================================================================
+    # ── Conversation state machine ────────────────────────────────────────────
 
     if current_state == BotState.WAITING_NAME:
         context.user_data["lead_name"] = raw_input
-        context.user_data["state"] = BotState.WAITING_EMAIL
-        await update.message.reply_text("📧 Please provide your professional email address configuration parameters:")
+        context.user_data["state"]     = BotState.WAITING_EMAIL
+        await update.message.reply_text(
+            "📧 Please enter your email address:"
+        )
         return
 
     if current_state == BotState.WAITING_EMAIL:
         if not validate_email(raw_input):
-            await update.message.reply_text("❌ Syntactic validation failed: Please specify a completely valid email syntax address (e.g., example@domain.com).")
-            return
-        
-        captured_name = context.user_data.get("lead_name", "Anonymous Client")
-        
-        try:
-            await asyncio.to_thread(save_lead, captured_name, raw_input)
-            logger.info(f"Successfully integrated high value business lead capture tracking down into data store layers for: {raw_input}")
             await update.message.reply_text(
-                "✅ **Information Captured Successfully**\n\nThank you for registering. Our enterprise sales engineering team will reach out directly shortly.",
-                reply_markup=MAIN_KEYBOARD,
-                parse_mode="Markdown"
+                "❌ That doesn't look like a valid email address.\n"
+                "Please try again (e.g. name@example.com)."
             )
-        except Exception as db_fault:
-            logger.error(f"Fault handling integration interface layer persistence write failure: {db_fault}", exc_info=True)
-            await update.message.reply_text("❌ Record tracking failed. Our core database storage layer encountered a temporary save state issue.", reply_markup=MAIN_KEYBOARD)
+            return
+
+        lead_name = context.user_data.get("lead_name", "Anonymous")
+
+        try:
+            result = save_lead(lead_name, raw_input)
+            if asyncio.iscoroutine(result):
+                await result
+            logger.info("Lead saved: %s <%s>", lead_name, raw_input)
+            await update.message.reply_text(
+                "✅ *Information Captured!*\n\n"
+                "Thank you — our team will be in touch shortly.",
+                reply_markup=MAIN_KEYBOARD,
+                parse_mode="Markdown",
+            )
+        except Exception as err:
+            logger.error("Failed to save lead: %s", err, exc_info=True)
+            await update.message.reply_text(
+                "❌ Failed to save your details. Please try again later.",
+                reply_markup=MAIN_KEYBOARD,
+            )
         finally:
             context.user_data["state"] = BotState.IDLE
             context.user_data.pop("lead_name", None)
         return
 
     if current_state == BotState.WAITING_IMAGE_PROMPT:
-        context.user_data["state"] = BotState.IDLE  # Reset locking mechanisms proactively
-        
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
-        status_banner = await update.message.reply_text("🎨 Creating your image... Synthesizing pixels...")
-        
-        generated_image_path: str | None = None
+        context.user_data["state"] = BotState.IDLE
+
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,  # type: ignore[union-attr]
+            action=ChatAction.UPLOAD_PHOTO,
+        )
+        status_msg = await update.message.reply_text(
+            "🎨 Generating your image, please wait…"
+        )
+
+        generated_path: str | None = None
         try:
-            # Relocate heavy model weights generations cleanly away from core loops
-            generated_image_path = await asyncio.to_thread(generate_image, raw_input)
-            
-            if generated_image_path and Path(generated_image_path).exists():
-                with open(generated_image_path, "rb") as delivery_payload:
+            generated_path = await asyncio.to_thread(generate_image, raw_input)
+
+            if generated_path and Path(generated_path).exists():
+                with open(generated_path, "rb") as img_file:
                     await update.message.reply_photo(
-                        photo=delivery_payload,
-                        caption=f"🎨 **Generated Asset Architecture Context Blueprint**\n_Prompt:_ \"{raw_input}\"",
+                        photo=img_file,
+                        caption=(
+                            f"🎨 *Generated Image*\n"
+                            f'_Prompt:_ "{raw_input}"'
+                        ),
                         reply_markup=MAIN_KEYBOARD,
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
                     )
-                await status_banner.delete()
+                await status_msg.delete()
             else:
-                raise FileNotFoundError("Downstream engine returned success path but target graphic image asset container is missing from file storage.")
-        except Exception as graphics_system_fault:
-            logger.error(f"Graphics infrastructure compute pipeline collapsed on frame delivery: {graphics_system_fault}", exc_info=True)
-            await status_banner.edit_text("❌ Imaging pipeline processing failure: Unable to complete high fidelity render configurations.")
+                raise FileNotFoundError(
+                    "Image generation succeeded but output file is missing."
+                )
+        except Exception as err:
+            logger.error(
+                "Image generation error for user %s: %s", user_id, err, exc_info=True
+            )
+            await status_msg.edit_text(
+                "❌ Image generation failed. Please try again later."
+            )
         finally:
-            if generated_image_path:
-                await safe_file_cleanup(generated_image_path)
+            if generated_path:
+                await safe_file_cleanup(generated_path)
         return
 
-    # =========================================================================
-    # STATIC NAVIGATION INTERFACE COMMAND MATCHING TERMINALS
-    # =========================================================================
+    # ── Static button routing ─────────────────────────────────────────────────
 
     if raw_input == "🌍 Language":
-        await update.message.reply_text("🌍 choose your languages below:", reply_markup=LANGUAGE_KEYBOARD)
+        await update.message.reply_text(
+            "🌍 Choose your language:",
+            reply_markup=LANGUAGE_KEYBOARD,
+        )
         return
 
     if raw_input in LANGUAGES_LIST:
         context.user_data["language"] = raw_input
-        await update.message.reply_text(f"✅ Language has bee changed **{raw_input}**", reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ Language changed to *{raw_input}*.",
+            reply_markup=MAIN_KEYBOARD,
+            parse_mode="Markdown",
+        )
         return
 
     if raw_input == "🛍 Products":
         await update.message.reply_text(
-            "🛍 **Enterprise Corporate Product Index Portfolio**\n\n"
-            "👕 *Premium Hoodie* — Advanced ergonomic dynamic thermal insulation profile garment design.\n"
-            "👟 *Sneakers* — Optimized structural impact absorption multi-density training lifestyle models.\n"
-            "🧥 *Jackets* — Heavy micro-weave atmospheric resilient ballistic environmental tracking gear.",
-            parse_mode="Markdown"
+            "🛍 *Our Products*\n\n"
+            "👕 *Premium Hoodie* — Thermal insulation garment.\n"
+            "👟 *Sneakers* — Impact-absorption training models.\n"
+            "🧥 *Jackets* — Weather-resilient outdoor gear.",
+            parse_mode="Markdown",
         )
         return
 
     if raw_input == "❓ FAQs":
         await update.message.reply_text(
-            "❓ **Systemic Frequently Asked Questions (FAQ) Documentation**\n\n"
-            "🚚 **Shipping Performance:** Global logistic routes execute baseline transit parameters within 3 to 7 business verification days.\n"
-            "💳 **Payment Rails Security:** Processing terminals securely authenticate modern transactions across Visa, Mastercard, and fully verified PayPal routing endpoints.\n"
-            "🔄 **Returns Strategy:** Compliance terms guarantee an absolute 30-day corporate return evaluation window protection assurance.",
-            parse_mode="Markdown"
+            "❓ *Frequently Asked Questions*\n\n"
+            "🚚 *Shipping:* 3–7 business days worldwide.\n"
+            "💳 *Payment:* Visa, Mastercard, PayPal accepted.\n"
+            "🔄 *Returns:* 30-day return window guaranteed.",
+            parse_mode="Markdown",
         )
         return
 
     if raw_input == "📞 Contact":
         context.user_data["state"] = BotState.WAITING_NAME
-        await update.message.reply_text("👤 Initiating secure lead onboarding interface.\n\nPlease enter your full  name:")
+        await update.message.reply_text(
+            "👤 Let's get your details.\n\nPlease enter your full name:"
+        )
         return
 
     if raw_input == "🎨 Generate Image":
         context.user_data["state"] = BotState.WAITING_IMAGE_PROMPT
-        await update.message.reply_text("🎨 **Image Generation Core Terminal Mode Activated**\n\nDescribe the image you want me to generate in high fidelity structural clarity details:", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🎨 *Image Generation Active*\n\n"
+            "Describe the image you want me to generate:",
+            parse_mode="Markdown",
+        )
         return
 
     if raw_input == "🎤 Voice Chat":
-        await update.message.reply_text("🎤 **Audio Telemetry System Active**\n\nSend me a voice message and i will listen, understand what you said,and reply with and answer.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🎤 *Voice Chat Ready*\n\n"
+            "Send me a voice message and I will transcribe and respond to it.",
+            parse_mode="Markdown",
+        )
         return
 
     if raw_input == "🤖 Ask AI":
-        await update.message.reply_text("🤖 **Ask me anything**\n\n am here for you ", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🤖 *Ask me anything!*\n\n"
+            "Type your question and I will answer it.",
+            parse_mode="Markdown",
+        )
         return
 
-    # =========================================================================
-    # DEFAULT ASYNCHRONOUS CONVERSATIONAL INFERENCE ENGINE
-    # =========================================================================
+    # ── Default: AI inference ─────────────────────────────────────────────────
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    conversational_status_banner = await update.message.reply_text("🤖 Thinking.......")
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,  # type: ignore[union-attr]
+        action=ChatAction.TYPING,
+    )
+    thinking_msg = await update.message.reply_text("🤖 Thinking…")
 
     try:
-        calculated_response_text = await execute_ai_pipeline_with_retry(raw_input, user_selected_lang)
-        response_segments = split_message_text(calculated_response_text)
-        
-        await conversational_status_banner.delete()
-        for textual_slice in response_segments:
-            await update.message.reply_text(textual_slice)
-            
-    except Exception as fallback_routing_fault:
-        logger.error(f"Global catch-all error handling failure inside linguistic chat core: {fallback_routing_fault}", exc_info=True)
-        await conversational_status_banner.edit_text("❌ Processing exception: Unable to interface query with compute clusters safely.")
+        response   = await execute_ai_pipeline_with_retry(raw_input, lang)
+        chunks     = split_message_text(response)
+        await thinking_msg.delete()
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+
+    except Exception as err:
+        logger.error(
+            "AI inference error for user %s: %s", user_id, err, exc_info=True
+        )
+        await thinking_msg.edit_text(
+            "❌ Sorry, I could not process your request. Please try again."
+        )
+
+# =============================================================================
+# ERROR HANDLER
+# =============================================================================
 
 
-async def global_system_error_boundary(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Intercepts and records trace matrix parameters preventing systemic memory runtime collapses."""
-    logger.error(f"Global System boundary intercepted unhandled engine trace Exception context metrics: {context.error}", exc_info=context.error)
-    
-    if isinstance(update, Update) and update.has_filter(filters.TEXT) and update.message:
+async def global_error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Log all unhandled exceptions and notify the user where possible."""
+    logger.error(
+        "Unhandled exception: %s", context.error, exc_info=context.error
+    )
+
+    if (
+        isinstance(update, Update)
+        and update.message
+    ):
         try:
-            await update.message.reply_text("❌ Core system interface exception: Operational continuity recovered safely.", reply_markup=MAIN_KEYBOARD)
-        except TelegramError as logging_subsystem_fault:
-            logger.critical(f"Fatal logging terminal transmission failure to broadcast tracking exception status bounds: {logging_subsystem_fault}")
+            await update.message.reply_text(
+                "❌ An unexpected error occurred. Please try again later.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        except TelegramError as tg_err:
+            logger.critical("Failed to send error reply: %s", tg_err)
 
-# =========================================================================
-# APPLICATION ENTRYPOINT RUNTIME ORCHESTRATION BLOCK
-# =========================================================================
+# =============================================================================
+# APPLICATION ENTRYPOINT
+# =============================================================================
+
 
 def main() -> NoReturn:
-    """Configures application pipeline architecture, maps event loops, and boots system engine processes."""
-    logger.info("Initializing enterprise engine instance configuration properties...")
-    
-    # Initialize the core application builder infrastructure
+    """Build the application, register all handlers, and start polling."""
+    logger.info("Starting AIHelperBot...")
+
+    # Run database migrations before starting the bot
+    logger.info("Running database migrations...")
+    run_migrations()
+
+    # Build the Telegram application
     runtime_application = Application.builder().token(BOT_TOKEN).build()
 
-    # Register deterministic telemetry route vectors
+    # ── Command handlers ───────────────────────────────────────────────────────
     runtime_application.add_handler(CommandHandler("start", start_command))
-    runtime_application.add_handler(MessageHandler(filters.VOICE, handle_incoming_voice))
-    runtime_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_incoming_text))
+    runtime_application.add_handler(CommandHandler("profile", profile))
+    runtime_application.add_handler(CommandHandler("membership", membership))
+    runtime_application.add_handler(CommandHandler("settings", settings))
+    runtime_application.add_handler(CommandHandler("notifications", notifications))
 
-    # Incorporate global error handling mitigation boundary frameworks
-    runtime_application.add_error_handler(global_system_error_boundary)
+    # ── Message handlers ───────────────────────────────────────────────────────
+    runtime_application.add_handler(
+        MessageHandler(filters.VOICE, handle_incoming_voice)
+    )
+    runtime_application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_incoming_text)
+    )
 
-    # Output startup verification system banner sequence strings
-    print("==================================================")
+    # ── Error handler ──────────────────────────────────────────────────────────
+    runtime_application.add_error_handler(global_error_handler)
+
+    print("=" * 50)
     print("🤖 AIHelperBot is running...")
     print("✅ Groq AI Enabled")
     print("✅ Multi-language Enabled")
@@ -436,11 +563,9 @@ def main() -> NoReturn:
     print("✅ AI Image Generation Enabled")
     print("✅ Contact Form Enabled")
     print("✅ Database Enabled")
-    print("==================================================")
-    
-    logger.info("Infrastructure checks passed successfully. Transitioning control directly into live long-polling loops.")
-    
-    # Engage core async runtime lifecycle operations indefinitely
+    print("=" * 50)
+
+    logger.info("Bot is now polling for updates.")
     runtime_application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

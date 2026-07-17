@@ -8,11 +8,13 @@ def create_tables():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE,
+        telegram_id BIGINT UNIQUE NOT NULL,
         username TEXT,
         full_name TEXT,
         wallet_address TEXT,
         membership TEXT DEFAULT 'Basic',
+        referral_count INTEGER DEFAULT 0,
+        total_earnings NUMERIC DEFAULT 0,
         joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
